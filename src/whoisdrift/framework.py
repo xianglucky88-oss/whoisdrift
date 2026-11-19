@@ -8,6 +8,7 @@ from lxml import html as _lh
 
 from .config import SPEC
 from .store import Store
+from . import status
 
 
 # --------------------------------------------------------------------------- #
@@ -115,21 +116,118 @@ def parse(resp_body, fmt):
     raise ValueError("unknown fmt: %s" % fmt)
 
 
-def fetch_all(http: Http):
-    """Collect records from the local source."""
+def _failure_kind(status_code):
+    """Classify an HTTP status as a collection failure kind."""
+    if status_code in (401, 403):
+        return "blocked"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code in (204, 404, 410):
+        return "missing_page"
+    return "source_error"
+
+
+def fetch_collect(http: Http):
+    """Collect records, reporting partial failures instead of conflating them.
+
+    Returns ``(records, attempts, info)`` where ``info`` contains:
+
+    ``complete``   whether every page up to the end was read;
+    ``pages``      number of pages successfully parsed;
+    ``failures``   a list of failure descriptors (page, status, reason).
+
+    A failed page stops the collection: the unseen tail is simply *unknown*.
+    Callers must not treat an incomplete collection as evidence that a domain
+    disappeared (see :func:`whoisdrift.kernel.failure_reason`).
+    """
     records, attempts, page = [], 0, 1
+    failures = []
+    complete = True
+    pages = 0
     while True:
-        status, _hdr, body, att = http.get("/" + SPEC.endpoint, params={"page": page})
+        try:
+            status, _hdr, body, att = http.get(
+                "/" + SPEC.endpoint, params={"page": page})
+        except Exception as exc:  # transport/offline failure
+            failures.append({"page": page, "status": None, "kind": "offline",
+                             "detail": "%s: %s" % (type(exc).__name__, exc)})
+            complete = False
+            break
         attempts += att + 1
         if status != 200:
-            raise RuntimeError("fetch failed status=%s page=%s" % (status, page))
-        page_recs = parse(body, SPEC.fmt)
+            kind = _failure_kind(status)
+            failures.append({"page": page, "status": status, "kind": kind,
+                             "detail": "page %s returned HTTP %s" % (page, status)})
+            complete = False
+            break
+        try:
+            page_recs = parse(body, SPEC.fmt)
+        except Exception as exc:  # unreadable/truncated response
+            failures.append({"page": page, "status": status,
+                             "kind": "unreadable",
+                             "detail": "%s: %s" % (type(exc).__name__, exc)})
+            complete = False
+            break
+        pages += 1
         records.extend(page_recs)
         if len(page_recs) < SPEC.page_size:
+            # Short page.  Before trusting it as the end, confirm the next page
+            # is genuinely empty: a dropped/omitted/short page must not silently
+            # look like an end of data (otherwise missing rows look like
+            # deletions).  A failure on that confirmation is itself a failure.
+            try:
+                status2, _h2, body2, att2 = http.get(
+                    "/" + SPEC.endpoint, params={"page": page + 1})
+            except Exception as exc:
+                failures.append({"page": page + 1, "status": None,
+                                 "kind": "offline",
+                                 "detail": "%s: %s" % (type(exc).__name__, exc)})
+                complete = False
+                break
+            attempts += att2 + 1
+            if status2 != 200:
+                failures.append({
+                    "page": page + 1, "status": status2,
+                    "kind": _failure_kind(status2),
+                    "detail": "end-of-data confirmation for page %s returned "
+                              "HTTP %s" % (page, status2)})
+                complete = False
+                break
+            try:
+                next_recs = parse(body2, SPEC.fmt)
+            except Exception as exc:
+                failures.append({"page": page + 1, "status": status2,
+                                 "kind": "unreadable",
+                                 "detail": "%s: %s" % (type(exc).__name__, exc)})
+                complete = False
+                break
+            if not next_recs:
+                break
+            failures.append({"page": page, "status": status,
+                             "kind": "short_page",
+                             "detail": "page %s held fewer than %s rows but page "
+                                       "%s still has data (next status %s)"
+                                       % (page, SPEC.page_size, page + 1, status2),
+                             "next_status": status2})
+            complete = False
             break
         page += 1
         if page > 200:
+            complete = False
+            failures.append({"page": page, "status": None, "kind": "page_limit",
+                             "detail": "pagination safety limit reached"})
             break
+    return records, attempts, {"complete": complete, "pages": pages,
+                               "failures": failures}
+
+
+def fetch_all(http: Http):
+    """Collect records from the local source (compatibility wrapper).
+
+    Returns ``(records, attempts)`` exactly as before.  Use
+    :func:`fetch_collect` when the completeness of the collection matters.
+    """
+    records, attempts, _info = fetch_collect(http)
     return records, attempts
 
 
@@ -176,31 +274,69 @@ def _apply_kernel(records):
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
-def run(mode="full", con=None):
+def kernel_module():
+    return importlib.import_module(".kernel", __package__)
+
+
+def run(mode="full", con=None, rules=None, run_id=None):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
     sleeper = Sleeper()
     http = Http(Transport(), sleeper)
+    k = kernel_module()
+    rules = k.make_rules(rules)
+    if run_id is None:
+        run_id = "run-%06d" % store.next_counter("run_seq")
+    run_seq_base = int(store.meta_get("observed_seq", "0") or 0)
     try:
-        records, attempts = fetch_all(http)
+        records, attempts, info = fetch_collect(http)
         norm = [normalize(dict(r)) for r in records]
         norm, dup_in_batch = dedup(norm)
         norm = _apply_kernel(norm)
 
         wm = store.watermark()
+        candidates = norm
         if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
+            candidates = [r for r in norm if str(r.get("ts", "")) > wm]
 
-        ingested = sum(1 for r in norm if store.upsert(r))
+        ingested = sum(1 for r in candidates if store.upsert(r))
+
+        # The event journal records *every* observed report, not just rows the
+        # incremental watermark admitted.  State resolution therefore converges
+        # between full and incremental collection, while record-table ingestion
+        # keeps its original watermark semantics.
+        events = status.event_batch(norm, run_id, start_seq=run_seq_base)
+        store.meta_set("observed_seq", run_seq_base + len(events))
+        summary = status.ingest_events(store, events, rules=rules, run_id=run_id)
+        failures = status.ingest_failures(
+            store, info["failures"], rules=rules, run_id=run_id)
+        decision_counts = store.decision_counts(run_id=run_id)
+
         total = store.count()
-        new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
-        if new_wm:
+        watermark_candidates = [str(r.get("ts", "")) for r in norm] + [wm or ""]
+        new_wm = max(watermark_candidates) if watermark_candidates else ""
+        # Never move the freshness checkpoint backwards.
+        if new_wm and (wm is None or str(new_wm) >= str(wm)):
             store.set_watermark(new_wm)
-        return {"engine": "crawl", "mode": mode, "fetched": len(records),
-                "duplicates": dup_in_batch, "ingested": ingested, "count": total,
+
+        current = store.all_current()
+        return {"engine": "crawl", "mode": mode, "run_id": run_id,
+                "fetched": len(records), "duplicates": dup_in_batch,
+                "ingested": ingested, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "watermark": store.watermark(),
+                "collection": {"complete": info["complete"],
+                               "pages": info["pages"]},
+                "failures": failures,
+                "events": {"new": summary["new_events"],
+                           "repeat": summary["repeat_events"]},
+                "status": decision_counts,
+                "domains": {d["id"]: {kk: d[kk] for kk in
+                                       ("state", "state_ts", "reason",
+                                        "terminal", "confirmed")}
+                            for d in current},
+                }
     finally:
         if own:
             con.close()
@@ -273,10 +409,15 @@ class Rpa:
         return bool(data.get("created"))
 
 
-def run_rpa(con=None):
+def run_rpa(con=None, rules=None, run_id=None):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
+    k = kernel_module()
+    rules = k.make_rules(rules)
+    if run_id is None:
+        run_id = "run-%06d" % store.next_counter("run_seq")
+    seq_base = int(store.meta_get("observed_seq", "0") or 0)
     r = Rpa()
     try:
         logged = r.login()
@@ -295,13 +436,26 @@ def run_rpa(con=None):
         for x in norm[:1]:
             if not r.submit(x):
                 dedup_submit += 1
-        wm = max([str(x.get("ts", "")) for x in norm] + [""])
+        events = status.event_batch(norm, run_id, start_seq=seq_base,
+                                    source="rpa")
+        store.meta_set("observed_seq", seq_base + len(events))
+        summary = status.ingest_events(store, events, rules=rules, run_id=run_id)
+        wm = max([str(x.get("ts", "")) for x in norm] + [store.watermark() or ""])
         if wm:
             store.set_watermark(wm)
+        current = store.all_current()
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
-                "ingested": ingested, "count": total,
-                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
+                "ingested": ingested, "count": total, "run_id": run_id,
+                "submit_created": created, "submit_dedup": dedup_submit,
+                "events": {"new": summary["new_events"],
+                           "repeat": summary["repeat_events"]},
+                "status": store.decision_counts(run_id=run_id),
+                "domains": {d["id"]: {kk: d[kk] for kk in
+                                       ("state", "state_ts", "reason",
+                                        "terminal", "confirmed")}
+                            for d in current},
+                "log": r.log}
     finally:
         if own:
             con.close()

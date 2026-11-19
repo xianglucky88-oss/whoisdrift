@@ -3,6 +3,8 @@ run:
 	PYTHONPATH=src:. $(PY) -m whoisdrift.cli
 run_inc:
 	PYTHONPATH=src:. $(PY) -m whoisdrift.cli --incremental
+reconcile:
+	PYTHONPATH=src:. $(PY) -m whoisdrift.cli --reconcile
 test:
 	PYTHONPATH=src:. $(PY) -m pytest -q
 mock:

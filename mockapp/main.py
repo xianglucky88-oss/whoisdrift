@@ -12,6 +12,11 @@ _ALL = build_rows()
 _extra = []
 _verified_sessions = set()
 _accepted_tokens = set()
+# Test controls (empty by default; the offline fixture behaves as before).
+_faults = {}        # page -> HTTP status to return instead of the page
+_offline = False    # raise, emulating an unreachable source
+_omit_pages = set() # pages to return as empty (a "missing page" without an error)
+
 
 def _data():
     return _ALL + _extra
@@ -20,9 +25,23 @@ def _page_items(page):
     lo, hi = (page - 1) * SPEC.page_size, page * SPEC.page_size
     return _data()[lo:hi]
 
+def _reset_source():
+    global _extra, _offline
+    _ALL[:] = build_rows()
+    _extra = []
+    _faults.clear()
+    _offline = False
+    _omit_pages.clear()
+    _verified_sessions.clear()
+    _accepted_tokens.clear()
+
 @app.get("/items")
 def items(page: int = 1):
-    data = _page_items(page)
+    if _offline:
+        raise RuntimeError("source is offline (simulated)")
+    if page in _faults:
+        return Response(status_code=int(_faults[page]))
+    data = [] if page in _omit_pages else _page_items(page)
     if SPEC.fmt == "json":
         return {"items": data, "page": page}
     if SPEC.fmt == "text":
@@ -39,12 +58,57 @@ def refresh():
     _extra.append(extra_row(len(_extra) + 1))
     return {"total": len(_data())}
 
+@app.get("/grow")
+def grow():
+    """Add a newer source row (alias used by incremental scenarios)."""
+    _extra.append(extra_row(len(_extra) + 1))
+    return {"total": len(_data())}
+
+@app.post("/reports")
+async def add_report(request: Request):
+    """Inject a raw status report (late, duplicate or conflicting by design).
+
+    Missing columns default from the first base row; ``status``/``ts``/``id``
+    are taken verbatim so out-of-order and conflicting reports can be built.
+    """
+    body = await request.json()
+    row = dict(_ALL[0])
+    for c in SPEC.columns:
+        if c in body:
+            row[c] = body[c]
+    _extra.append(row)
+    return {"total": len(_data()), "record": row}
+
+@app.post("/control")
+async def control(request: Request):
+    """Test-only fault injection: ``faults``, ``offline``, ``omit_pages``."""
+    global _offline
+    body = await request.json()
+    if body.get("reset"):
+        _reset_source()
+    if "offline" in body:
+        _offline = bool(body["offline"])
+    if "faults" in body:
+        _faults.clear()
+        _faults.update({int(k): int(v) for k, v in (body["faults"] or {}).items()})
+    if "omit_pages" in body:
+        _omit_pages.clear()
+        _omit_pages.update(int(p) for p in (body["omit_pages"] or []))
+    return {"faults": {str(k): v for k, v in _faults.items()},
+            "offline": _offline, "omit_pages": sorted(_omit_pages),
+            "rows": len(_data())}
+
 @app.get("/probe")
 def probe():
     app.__dict__["_flaky_n"] = app.__dict__.get("_flaky_n", 0) + 1
     if app.__dict__["_flaky_n"] <= 2:
         return Response(status_code=429)
     return {"ok": True, "attempts": app.__dict__["_flaky_n"]}
+
+@app.get("/flaky")
+def flaky():
+    """Alias of /probe, kept for callers that used the recovered upstream name."""
+    return probe()
 
 @app.get("/health")
 def health():
